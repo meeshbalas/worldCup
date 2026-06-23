@@ -21,7 +21,7 @@ def should_run_now(tz_name: str, target_hour: int, target_minute: int) -> bool:
     return n.hour == target_hour and n.minute == target_minute
 
 
-def est_day_bounds(tz_name: str) -> Tuple[datetime, datetime]:
+def et_day_bounds(tz_name: str) -> Tuple[datetime, datetime]:
     tz = pytz.timezone(tz_name)
     now_local = datetime.now(tz)
     start = tz.localize(datetime(now_local.year, now_local.month, now_local.day, 0, 0, 0))
@@ -45,7 +45,7 @@ class ProviderError(Exception):
 class APIFootballClient:
     def __init__(self, key: str):
         self.session = requests.Session()
-        self.session.headers.update({"x-apisports-key": key})
+        self.session.headers.update({"x-apisports-key": key.strip()})
 
     def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         r = self.session.get(f"{API_FOOTBALL_BASE}{path}", params=params, timeout=25)
@@ -54,8 +54,7 @@ class APIFootballClient:
         return r.json()
 
     def get_today_matches_world_cup(self, day_str: str) -> List[Dict[str, Any]]:
-        # Fetch all fixtures for the date, then filter to World Cup matches.
-        # This avoids hardcoding season=2022 and works for World Cup 2026 dates.
+        # Fetch all fixtures for the ET date and filter to World Cup competitions.
         data = self._get("/fixtures", {"date": day_str})
         fixtures = data.get("response", [])
 
@@ -70,13 +69,20 @@ class APIFootballClient:
         print(f"World Cup fixtures after filter: {len(world_cup_fixtures)}")
         return world_cup_fixtures
 
-    def get_team_recent_form(self, team_id: int, season: int = 2022) -> Dict[str, Any]:
-        # Keep season default for stats endpoint compatibility; can be tuned later.
-        data = self._get("/teams/statistics", {"league": 1, "season": season, "team": team_id})
+    def get_team_recent_form(self, team_id: int, league_id: int = 1, season: int = 2026) -> Dict[str, Any]:
+        data = self._get("/teams/statistics", {"league": league_id, "season": season, "team": team_id})
         return data.get("response", {})
 
     def get_fixture_players(self, fixture_id: int) -> List[Dict[str, Any]]:
         data = self._get("/fixtures/players", {"fixture": fixture_id})
+        return data.get("response", [])
+
+    def get_top_scorers(self, league_id: int, season: int) -> List[Dict[str, Any]]:
+        data = self._get("/players/topscorers", {"league": league_id, "season": season})
+        return data.get("response", [])
+
+    def get_top_assists(self, league_id: int, season: int) -> List[Dict[str, Any]]:
+        data = self._get("/players/topassists", {"league": league_id, "season": season})
         return data.get("response", [])
 
 
@@ -107,7 +113,7 @@ def outcome_probs(home_xg: float, away_xg: float) -> Tuple[float, float, float]:
     return normalize_probability(home, draw, away)
 
 
-def player_candidates_from_api_football(
+def player_candidates_from_fixture_players(
     players_blob: List[Dict[str, Any]]
 ) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], float]:
     scorers = []
@@ -140,10 +146,43 @@ def player_candidates_from_api_football(
     return top_prob(scorers), top_prob(assisters), completeness
 
 
-def fmt_est(iso_dt: str, tz_name: str) -> str:
+def player_candidates_from_top_lists(
+    top_scorers: List[Dict[str, Any]], top_assists: List[Dict[str, Any]], k: int = 5
+) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], float]:
+    s_out, a_out = [], []
+
+    if top_scorers:
+        take = top_scorers[:k]
+        total = 0.0
+        vals = []
+        for p in take:
+            name = safe_get(p, "player", "name", default="Unknown")
+            g = safe_get(p, "statistics", 0, "goals", "total", default=0)
+            g = float(g or 0)
+            vals.append((name, max(0.01, g)))
+            total += max(0.01, g)
+        s_out = [(n, round((v / total) * 100, 1)) for n, v in vals] if total > 0 else []
+
+    if top_assists:
+        take = top_assists[:k]
+        total = 0.0
+        vals = []
+        for p in take:
+            name = safe_get(p, "player", "name", default="Unknown")
+            a = safe_get(p, "statistics", 0, "goals", "assists", default=0)
+            a = float(a or 0)
+            vals.append((name, max(0.01, a)))
+            total += max(0.01, a)
+        a_out = [(n, round((v / total) * 100, 1)) for n, v in vals] if total > 0 else []
+
+    completeness = 0.55 if (s_out or a_out) else 0.35
+    return s_out, a_out, completeness
+
+
+def fmt_et(iso_dt: str, tz_name: str) -> str:
     dt = dtparser.parse(iso_dt)
     target = pytz.timezone(tz_name)
-    return dt.astimezone(target).strftime("%Y-%m-%d %I:%M %p %Z")
+    return dt.astimezone(target).strftime("%Y-%m-%d %I:%M %p") + " ET"
 
 
 def create_or_update_issue(repo_full_name: str, token: str, title: str, body: str):
@@ -168,7 +207,7 @@ def create_or_update_issue(repo_full_name: str, token: str, title: str, body: st
 def main():
     gh_token = os.getenv("GITHUB_TOKEN")
     repo_full_name = os.getenv("REPO_FULL_NAME")
-    api_football_key = os.getenv("API_FOOTBALL_KEY")
+    api_football_key = (os.getenv("API_FOOTBALL_KEY") or "").strip()
     tz_target = os.getenv("TZ_TARGET", "America/New_York")
     target_hour = int(os.getenv("TARGET_HOUR", "9"))
     target_minute = int(os.getenv("TARGET_MINUTE", "0"))
@@ -180,13 +219,13 @@ def main():
     if not api_football_key:
         raise RuntimeError("Missing required env var: API_FOOTBALL_KEY")
 
-    # Scheduled runs obey 9:00 ET gate. Manual runs always execute.
+    # Scheduled runs obey 9:00 ET gate; manual runs always execute.
     if event_name != "workflow_dispatch" and not force_run:
         if not should_run_now(tz_target, target_hour, target_minute):
             print("Not target local time. Exiting.")
             return
 
-    day_start, _ = est_day_bounds(tz_target)
+    day_start, _ = et_day_bounds(tz_target)
     day_str = day_start.strftime("%Y-%m-%d")
 
     af_client = APIFootballClient(api_football_key)
@@ -195,13 +234,13 @@ def main():
     try:
         matches = af_client.get_today_matches_world_cup(day_str)
     except Exception as e:
-        print(f"API-Football failed: {e}")
+        print(f"API-Football failed while fetching fixtures: {e}")
 
     title = f"World Cup Analyzer Report — {day_str} (ET)"
     lines = [
         f"# World Cup Daily Analyzer ({day_str} ET)",
         "",
-        f"**Generated at:** {now_in_tz(tz_target).strftime('%Y-%m-%d %I:%M %p %Z')}",
+        f"**Generated at:** {now_in_tz(tz_target).strftime('%Y-%m-%d %I:%M %p')} ET",
         "**Provider used:** api-football",
         "",
     ]
@@ -225,18 +264,20 @@ def main():
         away_name = safe_get(m, "teams", "away", "name", default="Away")
         home_id = safe_get(m, "teams", "home", "id")
         away_id = safe_get(m, "teams", "away", "id")
+        league_id = safe_get(m, "league", "id", default=1)
+        season = safe_get(m, "league", "season", default=2026)
 
         home_stats, away_stats = {}, {}
         if home_id:
             try:
-                home_stats = af_client.get_team_recent_form(home_id)
-            except Exception:
-                pass
+                home_stats = af_client.get_team_recent_form(home_id, league_id=league_id, season=season)
+            except Exception as e:
+                print(f"Team stats failed for {home_name}: {e}")
         if away_id:
             try:
-                away_stats = af_client.get_team_recent_form(away_id)
-            except Exception:
-                pass
+                away_stats = af_client.get_team_recent_form(away_id, league_id=league_id, season=season)
+            except Exception as e:
+                print(f"Team stats failed for {away_name}: {e}")
 
         home_xg = expected_goals_proxy(home_stats)
         away_xg = expected_goals_proxy(away_stats)
@@ -246,12 +287,24 @@ def main():
 
         scorers, assisters = [], []
         completeness = 0.35
+
+        # Primary: fixture-specific players
         if fixture_id:
             try:
                 players_blob = af_client.get_fixture_players(fixture_id)
-                scorers, assisters, completeness = player_candidates_from_api_football(players_blob)
-            except Exception:
-                pass
+                scorers, assisters, completeness = player_candidates_from_fixture_players(players_blob)
+            except Exception as e:
+                print(f"Fixture players unavailable for fixture {fixture_id}: {e}")
+
+        # Fallback: competition top lists
+        if not scorers and not assisters:
+            try:
+                top_s = af_client.get_top_scorers(league_id, season)
+                top_a = af_client.get_top_assists(league_id, season)
+                scorers, assisters, fallback_comp = player_candidates_from_top_lists(top_s, top_a)
+                completeness = max(completeness, fallback_comp)
+            except Exception as e:
+                print(f"Top scorers/assists fallback failed (league={league_id}, season={season}): {e}")
 
         freshness = 0.9
         outcome_conf = soft_confidence(gap, completeness, freshness)
@@ -259,7 +312,7 @@ def main():
 
         lines += [
             f"### {home_name} vs {away_name}",
-            f"- **Kickoff:** {fmt_est(kickoff_utc, tz_target) if kickoff_utc else 'TBD'}",
+            f"- **Kickoff:** {fmt_et(kickoff_utc, tz_target) if kickoff_utc else 'TBD'}",
             f"- **Outcome probabilities:** {home_name} Win **{p_home*100:.1f}%** | Draw **{p_draw*100:.1f}%** | {away_name} Win **{p_away*100:.1f}%**",
             f"- **Outcome confidence:** **{outcome_conf}%**",
             f"- **Top likely scorers:** " + (", ".join([f"{n} ({p}%)" for n, p in scorers]) if scorers else "Data unavailable"),
