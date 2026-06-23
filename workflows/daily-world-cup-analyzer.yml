@@ -2,8 +2,6 @@ name: Daily World Cup Analyzer
 
 on:
   schedule:
-    # 9:00 AM America/New_York (EST/EDT) == 13:00 UTC during EDT, 14:00 UTC during EST.
-    # Run hourly and gate in-script to exact local time for DST-safe behavior.
     - cron: '0 * * * *'
   workflow_dispatch:
 
@@ -32,7 +30,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-          FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
           TZ_TARGET: America/New_York
           TARGET_HOUR: '9'
           TARGET_MINUTE: '0'
