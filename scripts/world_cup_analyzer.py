@@ -44,7 +44,6 @@ class ProviderError(Exception):
 
 class APIFootballClient:
     def __init__(self, key: str):
-        self.key = key
         self.session = requests.Session()
         self.session.headers.update({"x-apisports-key": key})
 
@@ -55,6 +54,7 @@ class APIFootballClient:
         return r.json()
 
     def get_today_matches_world_cup(self, day_str: str) -> List[Dict[str, Any]]:
+        # World Cup code in API-Football is league=1; season can be adjusted in future tournaments.
         data = self._get("/fixtures", {"date": day_str, "league": 1, "season": 2022})
         return data.get("response", [])
 
@@ -94,10 +94,13 @@ def outcome_probs(home_xg: float, away_xg: float) -> Tuple[float, float, float]:
     return normalize_probability(home, draw, away)
 
 
-def player_candidates_from_api_football(players_blob: List[Dict[str, Any]]) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], float]:
+def player_candidates_from_api_football(
+    players_blob: List[Dict[str, Any]]
+) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], float]:
     scorers = []
     assisters = []
     sample = 0
+
     for team_block in players_blob:
         for p in team_block.get("players", []):
             sample += 1
@@ -156,21 +159,24 @@ def main():
     tz_target = os.getenv("TZ_TARGET", "America/New_York")
     target_hour = int(os.getenv("TARGET_HOUR", "9"))
     target_minute = int(os.getenv("TARGET_MINUTE", "0"))
+    event_name = os.getenv("GITHUB_EVENT_NAME", "")
+    force_run = os.getenv("FORCE_RUN", "false").lower() == "true"
 
     if not gh_token or not repo_full_name:
         raise RuntimeError("Missing required env vars: GITHUB_TOKEN and REPO_FULL_NAME")
     if not api_football_key:
         raise RuntimeError("Missing required env var: API_FOOTBALL_KEY")
 
-    if not should_run_now(tz_target, target_hour, target_minute):
-        print("Not target local time. Exiting.")
-        return
+    # Scheduled runs obey 9:00 ET gate; manual runs bypass.
+    if event_name != "workflow_dispatch" and not force_run:
+        if not should_run_now(tz_target, target_hour, target_minute):
+            print("Not target local time. Exiting.")
+            return
 
     day_start, _ = est_day_bounds(tz_target)
     day_str = day_start.strftime("%Y-%m-%d")
 
     af_client = APIFootballClient(api_football_key)
-    provider_used = "api-football"
     matches = []
 
     try:
@@ -179,12 +185,11 @@ def main():
         print(f"API-Football failed: {e}")
 
     title = f"World Cup Analyzer Report — {day_str} (ET)"
-
     lines = [
         f"# World Cup Daily Analyzer ({day_str} ET)",
         "",
         f"**Generated at:** {now_in_tz(tz_target).strftime('%Y-%m-%d %I:%M %p %Z')}",
-        f"**Provider used:** {provider_used}",
+        "**Provider used:** api-football",
         "",
     ]
 
@@ -208,8 +213,7 @@ def main():
         home_id = safe_get(m, "teams", "home", "id")
         away_id = safe_get(m, "teams", "away", "id")
 
-        home_stats = {}
-        away_stats = {}
+        home_stats, away_stats = {}, {}
         if home_id:
             try:
                 home_stats = af_client.get_team_recent_form(home_id)
@@ -224,12 +228,10 @@ def main():
         home_xg = expected_goals_proxy(home_stats)
         away_xg = expected_goals_proxy(away_stats)
         p_home, p_draw, p_away = outcome_probs(home_xg, away_xg)
-
         top_gap = sorted([p_home, p_draw, p_away], reverse=True)
         gap = top_gap[0] - top_gap[1]
 
-        scorers = []
-        assisters = []
+        scorers, assisters = [], []
         completeness = 0.35
         if fixture_id:
             try:
