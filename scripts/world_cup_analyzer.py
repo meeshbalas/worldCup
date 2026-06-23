@@ -1,8 +1,7 @@
 import os
 import math
-import json
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Tuple
 
 import pytz
 import requests
@@ -10,7 +9,6 @@ from dateutil import parser as dtparser
 from github import Github
 
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
-FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 
 
 def now_in_tz(tz_name: str) -> datetime:
@@ -69,30 +67,12 @@ class APIFootballClient:
         return data.get("response", [])
 
 
-class FootballDataClient:
-    def __init__(self, key: str):
-        self.key = key
-        self.session = requests.Session()
-        self.session.headers.update({"X-Auth-Token": key})
-
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        r = self.session.get(f"{FOOTBALL_DATA_BASE}{path}", params=params or {}, timeout=25)
-        if r.status_code >= 400:
-            raise ProviderError(f"Football-Data error {r.status_code}: {r.text[:300]}")
-        return r.json()
-
-    def get_today_matches_world_cup(self, day_str: str) -> List[Dict[str, Any]]:
-        data = self._get("/competitions/WC/matches", {"dateFrom": day_str, "dateTo": day_str})
-        return data.get("matches", [])
-
-
 def normalize_probability(a: float, b: float, c: float) -> Tuple[float, float, float]:
     s = max(a + b + c, 1e-9)
     return (a / s, b / s, c / s)
 
 
 def soft_confidence(gap: float, data_completeness: float, freshness: float) -> float:
-    # gap: probability delta between top two outcomes [0..1]
     base = min(max(gap * 1.35, 0), 1)
     conf = 0.55 * base + 0.30 * data_completeness + 0.15 * freshness
     return round(conf * 100, 1)
@@ -107,7 +87,6 @@ def expected_goals_proxy(team_stats: Dict[str, Any]) -> float:
 
 
 def outcome_probs(home_xg: float, away_xg: float) -> Tuple[float, float, float]:
-    # Simple heuristic approximating Poisson edge into 3-way probabilities.
     diff = home_xg - away_xg
     home = 0.40 + 0.22 * math.tanh(diff)
     away = 0.40 - 0.22 * math.tanh(diff)
@@ -174,13 +153,14 @@ def main():
     gh_token = os.getenv("GITHUB_TOKEN")
     repo_full_name = os.getenv("REPO_FULL_NAME")
     api_football_key = os.getenv("API_FOOTBALL_KEY")
-    football_data_key = os.getenv("FOOTBALL_DATA_KEY")
     tz_target = os.getenv("TZ_TARGET", "America/New_York")
     target_hour = int(os.getenv("TARGET_HOUR", "9"))
     target_minute = int(os.getenv("TARGET_MINUTE", "0"))
 
     if not gh_token or not repo_full_name:
         raise RuntimeError("Missing required env vars: GITHUB_TOKEN and REPO_FULL_NAME")
+    if not api_football_key:
+        raise RuntimeError("Missing required env var: API_FOOTBALL_KEY")
 
     if not should_run_now(tz_target, target_hour, target_minute):
         print("Not target local time. Exiting.")
@@ -189,24 +169,14 @@ def main():
     day_start, _ = est_day_bounds(tz_target)
     day_str = day_start.strftime("%Y-%m-%d")
 
-    primary_matches = []
-    provider_used = "none"
-    af_client = APIFootballClient(api_football_key) if api_football_key else None
-    fd_client = FootballDataClient(football_data_key) if football_data_key else None
+    af_client = APIFootballClient(api_football_key)
+    provider_used = "api-football"
+    matches = []
 
-    if af_client:
-        try:
-            primary_matches = af_client.get_today_matches_world_cup(day_str)
-            provider_used = "api-football"
-        except Exception as e:
-            print(f"API-Football failed: {e}")
-
-    if not primary_matches and fd_client:
-        try:
-            primary_matches = fd_client.get_today_matches_world_cup(day_str)
-            provider_used = "football-data"
-        except Exception as e:
-            print(f"Football-Data failed: {e}")
+    try:
+        matches = af_client.get_today_matches_world_cup(day_str)
+    except Exception as e:
+        print(f"API-Football failed: {e}")
 
     title = f"World Cup Analyzer Report — {day_str} (ET)"
 
@@ -218,11 +188,11 @@ def main():
         "",
     ]
 
-    if not primary_matches:
+    if not matches:
         lines += [
             "## Matches Today",
             "",
-            "No World Cup matches found for today, or provider data unavailable.",
+            "No World Cup matches found for today, or API-Football data unavailable.",
         ]
         create_or_update_issue(repo_full_name, gh_token, title, "\n".join(lines))
         return
@@ -230,83 +200,59 @@ def main():
     lines.append("## Matches Today (All times ET)")
     lines.append("")
 
-    if provider_used == "api-football":
-        for m in primary_matches:
-            fixture_id = safe_get(m, "fixture", "id")
-            kickoff_utc = safe_get(m, "fixture", "date", default="")
-            home_name = safe_get(m, "teams", "home", "name", default="Home")
-            away_name = safe_get(m, "teams", "away", "name", default="Away")
-            home_id = safe_get(m, "teams", "home", "id")
-            away_id = safe_get(m, "teams", "away", "id")
+    for m in matches:
+        fixture_id = safe_get(m, "fixture", "id")
+        kickoff_utc = safe_get(m, "fixture", "date", default="")
+        home_name = safe_get(m, "teams", "home", "name", default="Home")
+        away_name = safe_get(m, "teams", "away", "name", default="Away")
+        home_id = safe_get(m, "teams", "home", "id")
+        away_id = safe_get(m, "teams", "away", "id")
 
-            home_stats = {}
-            away_stats = {}
-            if af_client and home_id:
-                try:
-                    home_stats = af_client.get_team_recent_form(home_id)
-                except Exception:
-                    pass
-            if af_client and away_id:
-                try:
-                    away_stats = af_client.get_team_recent_form(away_id)
-                except Exception:
-                    pass
+        home_stats = {}
+        away_stats = {}
+        if home_id:
+            try:
+                home_stats = af_client.get_team_recent_form(home_id)
+            except Exception:
+                pass
+        if away_id:
+            try:
+                away_stats = af_client.get_team_recent_form(away_id)
+            except Exception:
+                pass
 
-            home_xg = expected_goals_proxy(home_stats)
-            away_xg = expected_goals_proxy(away_stats)
-            p_home, p_draw, p_away = outcome_probs(home_xg, away_xg)
+        home_xg = expected_goals_proxy(home_stats)
+        away_xg = expected_goals_proxy(away_stats)
+        p_home, p_draw, p_away = outcome_probs(home_xg, away_xg)
 
-            top_gap = sorted([p_home, p_draw, p_away], reverse=True)
-            gap = top_gap[0] - top_gap[1]
+        top_gap = sorted([p_home, p_draw, p_away], reverse=True)
+        gap = top_gap[0] - top_gap[1]
 
-            scorers = []
-            assisters = []
-            completeness = 0.35
-            if af_client and fixture_id:
-                try:
-                    players_blob = af_client.get_fixture_players(fixture_id)
-                    scorers, assisters, completeness = player_candidates_from_api_football(players_blob)
-                except Exception:
-                    pass
+        scorers = []
+        assisters = []
+        completeness = 0.35
+        if fixture_id:
+            try:
+                players_blob = af_client.get_fixture_players(fixture_id)
+                scorers, assisters, completeness = player_candidates_from_api_football(players_blob)
+            except Exception:
+                pass
 
-            freshness = 0.9
-            outcome_conf = soft_confidence(gap, completeness, freshness)
-            player_conf = round((0.6 * completeness + 0.4 * freshness) * 100, 1)
+        freshness = 0.9
+        outcome_conf = soft_confidence(gap, completeness, freshness)
+        player_conf = round((0.6 * completeness + 0.4 * freshness) * 100, 1)
 
-            lines += [
-                f"### {home_name} vs {away_name}",
-                f"- **Kickoff:** {fmt_est(kickoff_utc, tz_target) if kickoff_utc else 'TBD'}",
-                f"- **Outcome probabilities:** {home_name} Win **{p_home*100:.1f}%** | Draw **{p_draw*100:.1f}%** | {away_name} Win **{p_away*100:.1f}%**",
-                f"- **Outcome confidence:** **{outcome_conf}%**",
-                f"- **Top likely scorers:** " + (", ".join([f"{n} ({p}%)" for n, p in scorers]) if scorers else "Data unavailable"),
-                f"- **Top likely assisters:** " + (", ".join([f"{n} ({p}%)" for n, p in assisters]) if assisters else "Data unavailable"),
-                f"- **Player prediction confidence:** **{player_conf}%**",
-                "- **Key factors considered:** Team attacking rate proxy, relative matchup strength, available player shot/key-pass/goal contributions.",
-                "",
-            ]
-    else:
-        # football-data fallback: fewer player-level features generally available
-        for m in primary_matches:
-            utc_date = m.get("utcDate", "")
-            home_name = safe_get(m, "homeTeam", "name", default="Home")
-            away_name = safe_get(m, "awayTeam", "name", default="Away")
-
-            # conservative default model when only fixture-level data exists
-            p_home, p_draw, p_away = 0.39, 0.28, 0.33
-            gap = sorted([p_home, p_draw, p_away], reverse=True)[0] - sorted([p_home, p_draw, p_away], reverse=True)[1]
-            outcome_conf = soft_confidence(gap, 0.45, 0.85)
-
-            lines += [
-                f"### {home_name} vs {away_name}",
-                f"- **Kickoff:** {fmt_est(utc_date, tz_target) if utc_date else 'TBD'}",
-                f"- **Outcome probabilities:** {home_name} Win **{p_home*100:.1f}%** | Draw **{p_draw*100:.1f}%** | {away_name} Win **{p_away*100:.1f}%**",
-                f"- **Outcome confidence:** **{outcome_conf}%**",
-                "- **Top likely scorers:** Data limited on fallback provider",
-                "- **Top likely assisters:** Data limited on fallback provider",
-                "- **Player prediction confidence:** **52.0%**",
-                "- **Key factors considered:** Limited fixture-level fallback model due to provider data scope.",
-                "",
-            ]
+        lines += [
+            f"### {home_name} vs {away_name}",
+            f"- **Kickoff:** {fmt_est(kickoff_utc, tz_target) if kickoff_utc else 'TBD'}",
+            f"- **Outcome probabilities:** {home_name} Win **{p_home*100:.1f}%** | Draw **{p_draw*100:.1f}%** | {away_name} Win **{p_away*100:.1f}%**",
+            f"- **Outcome confidence:** **{outcome_conf}%**",
+            f"- **Top likely scorers:** " + (", ".join([f"{n} ({p}%)" for n, p in scorers]) if scorers else "Data unavailable"),
+            f"- **Top likely assisters:** " + (", ".join([f"{n} ({p}%)" for n, p in assisters]) if assisters else "Data unavailable"),
+            f"- **Player prediction confidence:** **{player_conf}%**",
+            "- **Key factors considered:** Team attacking rate proxy, relative matchup strength, available player shot/key-pass/goal contributions.",
+            "",
+        ]
 
     create_or_update_issue(repo_full_name, gh_token, title, "\n".join(lines))
 
