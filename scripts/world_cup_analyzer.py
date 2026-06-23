@@ -54,11 +54,24 @@ class APIFootballClient:
         return r.json()
 
     def get_today_matches_world_cup(self, day_str: str) -> List[Dict[str, Any]]:
-        # World Cup code in API-Football is league=1; season can be adjusted in future tournaments.
-        data = self._get("/fixtures", {"date": day_str, "league": 1, "season": 2022})
-        return data.get("response", [])
+        # Fetch all fixtures for the date, then filter to World Cup matches.
+        # This avoids hardcoding season=2022 and works for World Cup 2026 dates.
+        data = self._get("/fixtures", {"date": day_str})
+        fixtures = data.get("response", [])
+
+        world_cup_fixtures = []
+        for f in fixtures:
+            league = f.get("league") or {}
+            league_name = (league.get("name") or "").lower()
+            if "world cup" in league_name:
+                world_cup_fixtures.append(f)
+
+        print(f"Fetched fixtures for {day_str}: {len(fixtures)} total")
+        print(f"World Cup fixtures after filter: {len(world_cup_fixtures)}")
+        return world_cup_fixtures
 
     def get_team_recent_form(self, team_id: int, season: int = 2022) -> Dict[str, Any]:
+        # Keep season default for stats endpoint compatibility; can be tuned later.
         data = self._get("/teams/statistics", {"league": 1, "season": season, "team": team_id})
         return data.get("response", {})
 
@@ -167,7 +180,7 @@ def main():
     if not api_football_key:
         raise RuntimeError("Missing required env var: API_FOOTBALL_KEY")
 
-    # Scheduled runs obey 9:00 ET gate; manual runs bypass.
+    # Scheduled runs obey 9:00 ET gate. Manual runs always execute.
     if event_name != "workflow_dispatch" and not force_run:
         if not should_run_now(tz_target, target_hour, target_minute):
             print("Not target local time. Exiting.")
