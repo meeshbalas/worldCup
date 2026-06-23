@@ -8,25 +8,20 @@ This repository includes an automated **World Cup Analyzer** that runs every day
 - Collects today's World Cup matches (ET)
 - Computes:
   - Win/Draw/Lose likelihoods
-  - Player likely scorers/assisters (when supported by provider)
+  - Player likely scorers/assisters (when data is available)
   - Confidence scores for outcomes and player predictions
 - Creates or updates an issue named:
   - `World Cup Analyzer Report — YYYY-MM-DD (ET)`
 
-## Data providers
+## Data provider
 
-Priority order:
-1. **API-Football** (`API_FOOTBALL_KEY`)
-2. **Football-Data.org** fallback (`FOOTBALL_DATA_KEY`)
-
-If primary fails or has no data, fallback is used.
+- **API-Football** (`API_FOOTBALL_KEY`)
 
 ## Required GitHub Secrets
 
 In repository settings → Secrets and variables → Actions, add:
 
-- `API_FOOTBALL_KEY` (recommended)
-- `FOOTBALL_DATA_KEY` (fallback)
+- `API_FOOTBALL_KEY`
 
 `GITHUB_TOKEN` is provided by Actions automatically.
 
@@ -43,7 +38,6 @@ python -m pip install -r requirements.txt
 export GITHUB_TOKEN=...
 export REPO_FULL_NAME=meeshbalas/worldCup
 export API_FOOTBALL_KEY=...
-export FOOTBALL_DATA_KEY=...
 export TZ_TARGET=America/New_York
 export TARGET_HOUR=9
 export TARGET_MINUTE=0
